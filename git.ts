@@ -68,14 +68,23 @@ function delta(base: Buffer, next: Buffer): Buffer {
   for (let p = prefix; p < next.length; p += 127) { const b = next.subarray(p, p + 127); parts.push(Buffer.from([b.length]), b); }
   return Buffer.concat(parts);
 }
+const objectTypes = ['', 'commit', 'tree', 'blob', 'tag'];
+const packCache = new Map<string, Buffer>();
 function pack(repo: Repo, ids: Set<string>, deltas: boolean): Buffer {
+  const key = `${deltas}:${[...ids].join(',')}`, cached = packCache.get(key);
+  if (cached) return cached;
   const h = Buffer.alloc(12); h.write('PACK'); h.writeUInt32BE(2, 4); h.writeUInt32BE(ids.size, 8);
   const parts = [h]; let base: { id: string; o: GitObject } | undefined;
-  for (const id of ids) { const o = repo.objects.get(id)!; let data = o.data; let type = ['','commit','tree','blob','tag'].indexOf(o.type); let ref = Buffer.alloc(0);
+  for (const id of ids) { const o = repo.objects.get(id)!; let data = o.data; let type = objectTypes.indexOf(o.type); let ref = Buffer.alloc(0);
     if (deltas && o.type === 'blob' && base && o.data.length > 256) { const d = delta(base.o.data, data); if (d.length < data.length) {data = d; type = 7; ref = Buffer.from(base.id, 'hex');} }
     parts.push(header(type, data.length), ref, deflateSync(data)); if (o.type === 'blob') base = { id, o };
   }
-  const bytes = Buffer.concat(parts); return Buffer.concat([bytes, hash(bytes)]);
+  const bytes = Buffer.concat(parts), result = Buffer.concat([bytes, hash(bytes)]);
+  if (result.length <= 1024 * 1024) {
+    if (packCache.size >= 16) packCache.delete(packCache.keys().next().value!);
+    packCache.set(key, result);
+  }
+  return result;
 }
 function applyDelta(base: Buffer, d: Buffer): Buffer {
   let p = 0; const read = () => { let n = 0, shift = 0, v: number; do { if (p >= d.length || shift > 49) throw Error('invalid delta size'); v = d[p++]; n += (v & 127) * 2 ** shift; shift += 7; } while (v & 128); return n; };
@@ -104,7 +113,7 @@ function unpack(repo: Repo, b: Buffer): void {
   const byOffset = new Map(entries.map(e => [e.offset, e])); let remaining = entries.length;
   while (remaining) { let progress = false;
     for (const e of entries) { if (e.result) continue; let o: GitObject;
-      if (e.type < 6) o = {type: ['','commit','tree','blob','tag'][e.type] as GitObject['type'], data: e.data};
+      if (e.type < 6) o = {type: objectTypes[e.type] as GitObject['type'], data: e.data};
       else { const base = typeof e.base === 'number' ? byOffset.get(e.base)?.result : repo.objects.get(e.base!); if (!base) continue; o = {type: base.type, data: applyDelta(base.data,e.data)}; }
       object(repo,o.type,o.data); e.result = o; remaining--; progress = true;
     } if (!progress) throw Error('missing delta base');
@@ -159,6 +168,8 @@ export async function handleGit(store: Store, token: string | undefined, req: In
     const {lines} = packets(body); const values = (key: string) => lines.filter(l => l.startsWith(key + ' ')).map(l => l.slice(key.length + 1).split(' ')[0]);
     if (v2 && lines.includes('command=ls-refs')) {const prefixes = values('ref-prefix'); const out = refList(repo).filter(([name]) => !prefixes.length || prefixes.some(p => name.startsWith(p))).map(([name,id]) => pkt(`${id} ${name}${name === 'HEAD' && lines.includes('symrefs') ? ` symref-target:refs/heads/${repo.data.default_branch}` : ''}${lines.includes('peel') && repo.objects.get(id)?.type === 'tag' ? ` peeled:${peel(repo,id)}` : ''}\n`)); send(200,Buffer.concat([...out,flush]),`application/x-${service}-result`); return true;}
     const wants = values('want'), haves = values('have').filter(id => repo.objects.has(id)), shallow = new Set(values('shallow'));
+    const done = lines.includes('done');
+    if (v2 && !done && !haves.length) {send(200,Buffer.concat([pkt('acknowledgments\n'),pkt('NAK\n'),flush]),`application/x-${service}-result`); return true;}
     const depthText = values('deepen')[0];
     const depth = depthText === undefined ? Infinity : Number(depthText);
     if (!(depth > 0) || (depth !== Infinity && !Number.isSafeInteger(depth))) throw Error('invalid depth');
@@ -174,7 +185,7 @@ export async function handleGit(store: Store, token: string | undefined, req: In
       if (o?.type !== 'commit' || (visitedDepth.get(id) ?? Infinity) <= d) continue;
       visitedDepth.set(id,d);
       const ps = parents(o);
-      const blocked = ps.some(p => {
+      const blocked = (since !== 0 || excluded.size !== 0) && ps.some(p => {
         const parent = repo.objects.get(p);
         const timestamp = Number(parent?.data.toString().match(/^committer .* (\d+) [+-]\d{4}$/m)?.[1]);
         return excluded.has(p) || (since > 0 && timestamp < since);
@@ -185,7 +196,7 @@ export async function handleGit(store: Store, token: string | undefined, req: In
     if (!limited) for (const s of shallow) boundary.add(s);
     const held = closure(repo,haves,shallow), selected = closure(repo,wants,boundary); for (const id of held) selected.delete(id);
     const shallowLines = [...boundary].filter(id => !shallow.has(id)).map(id => `shallow ${id}\n`); if (limited) for (const id of shallow) if (visitedDepth.has(id) && !boundary.has(id)) shallowLines.push(`unshallow ${id}\n`);
-    const out: Buffer[] = []; const done = lines.includes('done');
+    const out: Buffer[] = [];
     if (v2) {
       if (!done) {out.push(pkt('acknowledgments\n'),...(haves.length ? haves.map(id => pkt(`ACK ${id}\n`)) : [pkt('NAK\n')])); if (!haves.length) {out.push(flush); send(200,Buffer.concat(out),`application/x-${service}-result`); return true;} out.push(pkt('ready\n'),delim);}
       if (shallowLines.length) out.push(pkt('shallow-info\n'),...shallowLines.map(pkt),delim); out.push(pkt('packfile\n'));
