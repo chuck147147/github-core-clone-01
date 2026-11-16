@@ -3,6 +3,15 @@ import { deflateSync, inflateSync, gunzipSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { object, type Repo, type Store, type GitObject, type FileEntry } from './store.ts';
 // Wire framing stays binary throughout: canonical object bytes are never reserialized.
+// Objects are immutable canonical payloads; validation follows object identity.
+const verified = new WeakSet<GitObject>();
+// Reads fall through to the live store; iteration visits only quarantined writes.
+class Overlay<K, V> extends Map<K, V> {
+  base: Map<K, V>;
+  constructor(base: Map<K, V>) { super(); this.base = base; }
+  get(key: K): V | undefined { return super.has(key) ? super.get(key) : this.base.get(key); }
+  has(key: K): boolean { return super.has(key) || this.base.has(key); }
+}
 const ZERO = '0'.repeat(40);
 const hash = (b: Buffer) => createHash('sha1').update(b).digest();
 export function pkt(data: string | Buffer): Buffer { const b = Buffer.from(data); return Buffer.concat([Buffer.from((b.length + 4).toString(16).padStart(4, '0')), b]); }
@@ -38,6 +47,17 @@ function closure(repo: Repo, tips: string[], stops = new Set<string>()): Set<str
   const found = new Set<string>(); const pending = [...tips];
   while (pending.length) { const id = pending.pop()!; if (found.has(id)) continue; const o = repo.objects.get(id); if (!o) throw Error(`missing object ${id}`); found.add(id); pending.push(...links(o, stops.has(id))); }
   return found;
+}
+// Validate only new graph segments. Mark objects only after the entire traversal succeeds.
+function validateClosure(repo: Repo, tip: string): void {
+  const seen = new Set<GitObject>(), pending = [tip];
+  while (pending.length) {
+    const id = pending.pop()!, o = repo.objects.get(id);
+    if (!o) throw Error(`missing object ${id}`);
+    if (verified.has(o) || seen.has(o)) continue;
+    seen.add(o); pending.push(...links(o));
+  }
+  for (const o of seen) verified.add(o);
 }
 function varint(n: number): Buffer { const out: number[] = []; do { const v = n & 127; n = Math.floor(n / 128); out.push(v | (n ? 128 : 0)); } while (n); return Buffer.from(out); }
 function header(type: number, size: number): Buffer { const a = [(type << 4) | (size & 15)]; size = Math.floor(size / 16); if (size) a[0] |= 128; while (size) { const v = size & 127; size = Math.floor(size / 128); a.push(v | (size ? 128 : 0)); } return Buffer.from(a); }
@@ -123,16 +143,16 @@ export async function handleGit(store: Store, token: string | undefined, req: In
     if (service === 'git-receive-pack') {
       const {lines,offset} = packets(body,true), caps = lines[0]?.split('\0')[1] ?? ''; const commands = lines.map(l => l.split('\0')[0].split(' '));
       // Quarantine objects and derived indexes until the entire pack has verified.
-      let unpackError = ''; const staged: Repo = {...repo, objects:new Map(repo.objects), commits:new Map(repo.commits)};
+      let unpackError = ''; const staged: Repo = {...repo, objects:new Overlay(repo.objects), commits:new Overlay(repo.commits)};
       try { if (body.length > offset) unpack(staged,body.subarray(offset)); else if (commands.some(c => c[1] !== ZERO)) throw Error('missing pack'); indexCommits(staged); } catch (e) {unpackError = (e as Error).message;}
       const seen = new Set<string>(); const reports = commands.map(([old,next,ref]) => { let reason = unpackError ? 'unpacker error' : '';
         if (!/^[a-f0-9]{40}$/.test(old ?? '') || !/^[a-f0-9]{40}$/.test(next ?? '') || !/^refs\/(heads|tags)\/.+/.test(ref ?? '') || /[\s~^:?*\[\\]|\.\.|@\{|\/\/|\/$|\.$/.test(ref ?? '') || seen.has(ref)) reason = 'invalid ref'; seen.add(ref);
         if (!reason && (repo.refs.get(ref) ?? ZERO) !== old) reason = 'stale old object';
-        if (!reason && next !== ZERO) {try {closure(staged,[next]); if (ref.startsWith('refs/heads/') && staged.objects.get(next)?.type !== 'commit') reason = 'not a commit'; else if (old !== ZERO && ref.startsWith('refs/heads/')) { const pending = [next], visited = new Set<string>(); let ancestor = false; while (pending.length) { const id = pending.pop()!; if (id === old) {ancestor = true; break;} if (visited.has(id)) continue; visited.add(id); const o = staged.objects.get(id); if (o?.type === 'commit') pending.push(...parents(o)); } if (!ancestor) reason = 'non-fast-forward'; }} catch {reason = 'missing object';} }
+        if (!reason && next !== ZERO) {try {validateClosure(staged,next); if (ref.startsWith('refs/heads/') && staged.objects.get(next)?.type !== 'commit') reason = 'not a commit'; else if (old !== ZERO && ref.startsWith('refs/heads/')) { const pending = [next], visited = new Set<string>(); let ancestor = false; while (pending.length) { const id = pending.pop()!; if (id === old) {ancestor = true; break;} if (visited.has(id)) continue; visited.add(id); const o = staged.objects.get(id); if (o?.type === 'commit') pending.push(...parents(o)); } if (!ancestor) reason = 'non-fast-forward'; }} catch {reason = 'missing object';} }
         return {ref,next,reason}; });
       // Ordinary report-status permits mixed success; the atomic capability opts into rollback.
       if (caps.split(' ').includes('atomic') && reports.some(r => r.reason)) for (const r of reports) r.reason ||= 'atomic push failure';
-      if (!unpackError) {repo.objects = staged.objects; repo.commits = staged.commits; for (const r of reports) if (!r.reason) {if (r.next === ZERO) repo.refs.delete(r.ref); else repo.refs.set(r.ref,r.next);} }
+      if (!unpackError) {for (const [id,o] of staged.objects) repo.objects.set(id,o); for (const [id,c] of staged.commits) repo.commits.set(id,c); for (const r of reports) if (!r.reason) {if (r.next === ZERO) repo.refs.delete(r.ref); else repo.refs.set(r.ref,r.next);} }
       const report = Buffer.concat([pkt(`unpack ${unpackError || 'ok'}\n`),...reports.map(r => pkt(`${r.reason ? 'ng' : 'ok'} ${r.ref}${r.reason ? ' ' + r.reason : ''}\n`)),flush]);
       send(200, caps.includes('side-band-64k') ? Buffer.concat([...bands(report),flush]) : report,`application/x-${service}-result`); return true;
     }
